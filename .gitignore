@@ -1,0 +1,7 @@
+# build outputs and downloaded sources
+/out/
+/out.new/
+/build/
+/third_party/
+# generated test media
+/test-media/

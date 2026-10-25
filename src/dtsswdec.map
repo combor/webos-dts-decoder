@@ -1,0 +1,9 @@
+/* Export only the GStreamer plugin entry points. Everything else, FFmpeg in
+ * particular, stays local so it cannot clash with the TV's own libavcodec. */
+{
+  global:
+    gst_plugin_dtsswdec_get_desc;
+    gst_plugin_dtsswdec_register;
+  local:
+    *;
+};

@@ -1,0 +1,4 @@
+*
+!src/
+!scripts/
+!third_party/ffmpeg-*.tar.xz

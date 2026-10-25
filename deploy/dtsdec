@@ -1,0 +1,378 @@
+#!/bin/sh
+# webos-dts-decoder: makes the DTS decoder plugin visible to the TV's media
+# pipeline.
+#
+# Installed as /var/lib/dtsdec/dtsdec by deploy/install.sh and run on every
+# boot by /var/lib/webosbrew/init.d/60-dtsdec. Nothing on the read-only
+# system partitions is changed: the media pipeline never scans for plugins,
+# it trusts its GStreamer registry file, so a copy of that registry with the
+# plugin added is bind-mounted over the stock one, which stays untouched
+# underneath. The mount disappears on reboot.
+#
+#   dtsdec start     set up, then refresh idle media pipelines (boot hook)
+#   dtsdec watch-output
+#                    keep $RUN/sound-output current (started by start)
+#   dtsdec stop      undo until the next boot
+#   dtsdec status    show what is active
+#   dtsdec registry  only build the registry (in $DTSDEC_DIR, default
+#                    /var/lib/dtsdec), without activating it
+#
+#   Turn off:   touch /var/lib/dtsdec/disabled && reboot
+#   Log:        /tmp/dtsdec/log
+
+SELF=$(readlink -f "$0")
+DIR=${DTSDEC_DIR:-/var/lib/dtsdec}
+RUN=/tmp/dtsdec
+PLUGIN_DIR=$DIR/plugins
+PLUGIN=$PLUGIN_DIR/libgstdtsswdec.so
+REGISTRY=$DIR/registry.bin
+PIPELINE_BIN=/usr/sbin/starfish-media-pipeline
+WATCHER_PID=$RUN/watcher.pid
+SOUND_OUTPUT=$RUN/sound-output
+
+log() {
+    msg="$(date '+%F %T') $*"
+    echo "$msg"
+    echo "$msg" >>"$RUN/log"
+}
+
+die() {
+    log "error: $*"
+    exit 1
+}
+
+disabled() {
+    [ -e "$DIR/disabled" ]
+}
+
+# PIDs of processes running the given executable
+pids_of() {
+    for p in /proc/[0-9]*; do
+        [ "$(readlink "$p/exe" 2>/dev/null)" = "$1" ] && echo "${p#/proc/}"
+    done
+}
+
+# The media pipeline inherits umediaserver's environment: registry location,
+# plugin paths, and the vendor library path and preload. Plugins scanned
+# without the latter fail to load and get blacklisted, so registries are
+# built and inspected with exactly this environment (see media_run).
+load_media_env() {
+    i=0
+    while ums=$(pids_of /usr/sbin/umediaserver | head -n 1); [ -z "$ums" ]; do
+        i=$((i + 1))
+        [ $i -ge 30 ] && die "umediaserver is not running"
+        sleep 2
+    done
+    tr '\0' '\n' <"/proc/$ums/environ" |
+        grep -E '^(GST_[A-Z0-9_]+|LD_LIBRARY_PATH|LD_PRELOAD)=' |
+        sed "s/'/'\\\\''/g; s/=\(.*\)/='\1'/; s/^/export /" >"$RUN/env"
+    MEDIA_REGISTRY=$(. "$RUN/env" && echo "${GST_REGISTRY_1_0:-}")
+    [ -n "$MEDIA_REGISTRY" ] || die "umediaserver has no GST_REGISTRY_1_0"
+}
+
+# Runs a command in the media pipeline's environment; VAR=value arguments
+# before the command override it.
+media_run() {
+    (
+        . "$RUN/env"
+        while [ $# -gt 0 ]; do
+            case $1 in
+            *=*) export "${1?}" ;;
+            *) break ;;
+            esac
+            shift
+        done
+        exec "$@"
+    )
+}
+
+is_mounted() {
+    grep -q " $(readlink -f "$1") " /proc/mounts
+}
+
+unmount() {
+    umount "$1" 2>/dev/null || umount -l "$1"
+}
+
+plugin_sum() {
+    sha256sum <"$PLUGIN" | cut -d' ' -f1
+}
+
+# Element and plugin list of a registry file, without loading any plugin
+registry_features() {
+    media_run GST_REGISTRY_1_0="$1" GST_REGISTRY_UPDATE=no gst-inspect-1.0 \
+        2>/dev/null | grep -v '^Total count' | sort
+}
+
+# Builds $REGISTRY from the stock registry plus the plugin, unless the one
+# there was already built from this stock registry and this plugin.
+build_registry() {
+    key="$(sha256sum <"$MEDIA_REGISTRY" | cut -d' ' -f1) $(plugin_sum)"
+    if [ -f "$REGISTRY" ] && [ "$(cat "$DIR/registry.key" 2>/dev/null)" = "$key" ]; then
+        log "registry is up to date"
+        return 0
+    fi
+
+    log "building registry from $MEDIA_REGISTRY"
+    tmp=$DIR/registry.tmp
+    cp "$MEDIA_REGISTRY" "$tmp" || die "cannot copy the stock registry"
+    # Starting from a copy keeps every existing entry as it is; the scan only
+    # adds what is new, i.e. the plugin.
+    plugin_path=$(. "$RUN/env" && echo "${GST_PLUGIN_PATH_1_0:-}")
+    if ! media_run GST_REGISTRY_1_0="$tmp" GST_REGISTRY_UPDATE=yes \
+        GST_PLUGIN_PATH_1_0="${plugin_path:+$plugin_path:}$PLUGIN_DIR" \
+        gst-inspect-1.0 dtsswdec >"$RUN/scan.log" 2>&1; then
+        rm -f "$tmp"
+        die "the plugin did not load, see $RUN/scan.log"
+    fi
+
+    # Accept it only if it is the stock registry plus the plugin, nothing less
+    registry_features "$MEDIA_REGISTRY" >"$RUN/features.stock"
+    registry_features "$tmp" | grep -v dtsswdec >"$RUN/features.new"
+    if [ ! -s "$RUN/features.stock" ] ||
+        ! cmp -s "$RUN/features.stock" "$RUN/features.new"; then
+        rm -f "$tmp"
+        die "new registry differs from the stock one beyond the plugin"
+    fi
+
+    chmod 644 "$tmp"
+    mv "$tmp" "$REGISTRY"
+    echo "$key" >"$DIR/registry.key"
+}
+
+# IDs of the pipelines umediaserver has in use; fails if it cannot be asked
+active_pipeline_ids() {
+    reply=$(timeout -t 10 luna-send -n 1 luna://com.webos.media/getActivePipelines '{}' \
+        </dev/null 2>/dev/null) || return 1
+    case $reply in
+    \[*) ;;
+    *) return 1 ;;
+    esac
+    echo "$reply" | grep -o '"id": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# True if the process has a device open, as a pipeline playing media does
+# (decoders, audio output); an idle spare has only /dev/null and the like.
+uses_devices() {
+    for fd in "/proc/$1/fd/"*; do
+        case $(readlink "$fd" 2>/dev/null) in
+        /dev/null | /dev/zero | /dev/random | /dev/urandom | /dev/console | \
+            /dev/kmsg | /dev/shm/* | /dev/pts/*) ;;
+        /dev/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# The media pipeline pool keeps a spare process that read the registry when it
+# started. Replace spares started before the registry changed; umediaserver
+# refills the pool a second later. A pipeline is only killed if umediaserver
+# does not list it as active (asked again right before the kill) and it has no
+# device open; when in doubt it counts as busy. Returns 1 while any outdated
+# pipeline is busy.
+refresh_idle_pipelines() {
+    since=$1
+    pending=0
+    for pid in $(pids_of "$PIPELINE_BIN"); do
+        started=$(cut -d' ' -f22 "/proc/$pid/stat" 2>/dev/null) || continue
+        [ "$started" -lt "$since" ] || continue
+        id=$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null |
+            sed -n 's/^-scom\.webos\.pipeline\.//p')
+        if [ -z "$id" ] || uses_devices "$pid" ||
+            ! ids=$(active_pipeline_ids) || echo "$ids" | grep -qx "$id"; then
+            pending=1
+            continue
+        fi
+        log "restarting idle media pipeline $pid"
+        kill "$pid"
+    done
+    return $pending
+}
+
+# Refreshes idle pipelines now; if one is busy, keeps retrying in the
+# background for up to 30 minutes.
+refresh_pipelines() {
+    since=$(now_ticks)
+    refresh_idle_pipelines "$since" && return 0
+    log "a media pipeline is busy; refreshing it once idle"
+    (
+        i=0
+        while sleep 15; do
+            refresh_idle_pipelines "$since" && exit 0
+            i=$((i + 1))
+            [ $i -ge 120 ] && break
+        done
+        log "gave up waiting; the change applies once that pipeline exits"
+    ) </dev/null >/dev/null 2>&1 &
+}
+
+# Uptime in clock ticks, the unit of process start times in /proc/<pid>/stat
+now_ticks() {
+    hz=$(getconf CLK_TCK 2>/dev/null) || hz=
+    awk -v hz="${hz:-100}" '{ printf "%d", $1 * hz }' /proc/uptime
+}
+
+# The decoder's arc-passthrough mode needs to know where the TV sends its
+# sound. The watcher keeps $SOUND_OUTPUT as "<watcher pid> <soundOutput>
+# <soundOutputDigital>"; the decoder treats a missing file or a dead watcher
+# as "not ARC" and decodes to stereo, since the TV speakers would play the
+# bitstream as loud noise.
+watcher_running() {
+    pid=$(cat "$WATCHER_PID" 2>/dev/null) && [ -n "$pid" ] &&
+        tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'watch-output'
+}
+
+start_watcher() {
+    watcher_running && return 0
+    "$SELF" watch-output </dev/null >/dev/null 2>&1 &
+    # recorded here, not only by the watcher, so that a second start right
+    # after this one sees it
+    echo $! >"$WATCHER_PID"
+    log "started the sound output watcher"
+}
+
+# Stops every watcher, not just the recorded one
+stop_watcher() {
+    for w in /proc/[0-9]*; do
+        tr '\0' ' ' <"$w/cmdline" 2>/dev/null | grep -q 'dtsdec watch-output' ||
+            continue
+        w=${w#/proc/}
+        # its children first: luna-send would keep the pipeline alive
+        for p in /proc/[0-9]*; do
+            [ "$(cut -d' ' -f4 "$p/stat" 2>/dev/null)" = "$w" ] &&
+                kill "${p#/proc/}" 2>/dev/null
+        done
+        kill "$w" 2>/dev/null
+    done
+    rm -f "$WATCHER_PID" "$SOUND_OUTPUT"
+}
+
+cmd_watch_output() {
+    echo $$ >"$WATCHER_PID"
+    trap 'rm -f "$SOUND_OUTPUT"; exit 0' TERM INT
+    while :; do
+        luna-send -i luna://com.webos.settingsservice/getSystemSettings \
+            '{"category":"sound","keys":["soundOutput","soundOutputDigital"],"subscribe":true}' \
+            </dev/null 2>/dev/null | {
+            out=
+            digital=
+            while read -r line; do
+                v=$(echo "$line" | sed -n 's/.*"soundOutput" *: *"\([^"]*\)".*/\1/p')
+                [ -n "$v" ] && out=$v
+                v=$(echo "$line" | sed -n 's/.*"soundOutputDigital" *: *"\([^"]*\)".*/\1/p')
+                [ -n "$v" ] && digital=$v
+                [ -n "$out" ] && [ -n "$digital" ] || continue
+                echo "$$ $out $digital" >"$SOUND_OUTPUT.tmp" &&
+                    mv "$SOUND_OUTPUT.tmp" "$SOUND_OUTPUT"
+            done
+        }
+        # the subscription ended: fail safe until it is back
+        rm -f "$SOUND_OUTPUT"
+        sleep 5
+    done
+}
+
+cmd_start() {
+    disabled && {
+        log "disabled, not starting"
+        return 0
+    }
+    [ -f "$PLUGIN" ] || die "$PLUGIN is missing"
+    load_media_env
+    start_watcher
+
+    if is_mounted "$MEDIA_REGISTRY"; then
+        if [ "$(cut -d' ' -f2 "$DIR/registry.key" 2>/dev/null)" = "$(plugin_sum)" ]; then
+            log "already active"
+            return 0
+        fi
+        log "plugin changed, rebuilding"
+        unmount "$MEDIA_REGISTRY" || die "cannot unmount the registry"
+    fi
+
+    build_registry
+    mount --bind "$REGISTRY" "$MEDIA_REGISTRY" || die "cannot mount the registry"
+    log "registry with dtsswdec mounted over $MEDIA_REGISTRY"
+    refresh_pipelines
+}
+
+cmd_stop() {
+    load_media_env
+    stop_watcher
+    if is_mounted "$MEDIA_REGISTRY"; then
+        unmount "$MEDIA_REGISTRY" || die "cannot unmount the registry"
+        log "stock registry restored"
+        refresh_pipelines
+    else
+        log "not active"
+    fi
+}
+
+cmd_status() {
+    load_media_env
+    disabled && echo "disabled:  yes (kill switch present)" || echo "disabled:  no"
+    if [ -f "$PLUGIN" ]; then
+        echo "plugin:    $PLUGIN"
+        echo "sha256:    $(plugin_sum)"
+    else
+        echo "plugin:    missing"
+    fi
+    if is_mounted "$MEDIA_REGISTRY"; then
+        echo "registry:  $REGISTRY mounted over $MEDIA_REGISTRY"
+    else
+        echo "registry:  stock"
+    fi
+    echo "downmix:   $(cat "$DIR/downmix" 2>/dev/null || echo "stereo (no $DIR/downmix)")"
+    if watcher_running && [ -f "$SOUND_OUTPUT" ]; then
+        echo "output:    $(cut -d' ' -f2- "$SOUND_OUTPUT")"
+    else
+        echo "output:    unknown (watcher not running)"
+    fi
+    if media_run GST_REGISTRY_UPDATE=no gst-inspect-1.0 dtsswdec >/dev/null 2>&1; then
+        echo "decoder:   dtsswdec visible to the media pipeline"
+    else
+        echo "decoder:   not visible to the media pipeline"
+        return 1
+    fi
+}
+
+# /tmp is writable by every app on the TV, and files in $RUN are sourced as
+# root, so only use the directory if root owns it and nobody else can write to
+# it; anything else is moved out of the way. Others may read it: the media
+# pipeline, which reads sound-output, does not run as root on every TV.
+runtime_dir_safe() {
+    [ -d "$RUN" ] && [ ! -L "$RUN" ] || return 1
+    owner_mode=$(stat -c '%u %a' "$RUN" 2>/dev/null) || return 1
+    [ "${owner_mode% *}" = 0 ] || return 1
+    # no write permission for group or others
+    [ $((0${owner_mode#* } & 022)) -eq 0 ]
+}
+if ! mkdir -m 755 "$RUN" 2>/dev/null; then
+    if runtime_dir_safe; then
+        chmod 755 "$RUN"
+    else
+        mv "$RUN" "$RUN.untrusted.$$" 2>/dev/null
+        mkdir -m 755 "$RUN" || {
+            echo "error: cannot create a private $RUN" >&2
+            exit 1
+        }
+    fi
+fi
+
+case ${1:-} in
+start) cmd_start ;;
+stop) cmd_stop ;;
+status) cmd_status ;;
+watch-output) cmd_watch_output ;;
+registry)
+    load_media_env
+    # while active, the stock registry is hidden under ours
+    is_mounted "$MEDIA_REGISTRY" && die "active; run '$0 stop' first"
+    build_registry
+    echo "$REGISTRY"
+    ;;
+*)
+    echo "usage: $0 start|stop|status|registry|watch-output" >&2
+    exit 2
+    ;;
+esac

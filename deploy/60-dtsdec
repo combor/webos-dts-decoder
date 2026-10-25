@@ -1,0 +1,11 @@
+#!/bin/sh
+# webos-dts-decoder boot hook, run by Homebrew Channel's startup.sh (run-parts
+# of /var/lib/webosbrew/init.d). Does the work in the background so that
+# waiting for an idle media pipeline does not hold up other hooks.
+#
+#   Turn off:          touch /var/lib/dtsdec/disabled && reboot
+#   Remove completely: deploy/uninstall.sh, or delete this file,
+#                      /var/lib/dtsdec and reboot
+
+[ -x /var/lib/dtsdec/dtsdec ] || exit 0
+/var/lib/dtsdec/dtsdec start </dev/null >/dev/null 2>&1 &
