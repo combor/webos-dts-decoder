@@ -25,8 +25,8 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # build.sh downloads the tarball into third_party/ and reads these two lines.
-ARG FFMPEG_VERSION=9.0.2
-ARG FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
+ARG FFMPEG_VERSION=9.1
+ARG FFMPEG_SHA256=1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433
 
 ENV SOURCE_DATE_EPOCH=0
 
